@@ -10,6 +10,8 @@ const DEFAULT_BASE_URL = 'https://api.keenable.ai'
 const DEFAULT_MAX_CHARS = 10000
 
 interface KeenableFetchResponse {
+    error?: { status?: number; message?: string; error?: string }
+
     url?: string
     title?: string
     content?: string
@@ -52,7 +54,7 @@ class KeenableFetch_Tools implements INode {
                 name: 'live',
                 type: 'boolean',
                 default: false,
-                description: 'Fetch the live page instead of the indexed copy. Requires an API key.',
+                description: 'Fetch the live page (`retrieval.max_age_hours: 0`) instead of the indexed copy. Requires an API key.',
                 additionalParams: true,
                 optional: true
             },
@@ -167,20 +169,26 @@ class KeenableFetchTool extends Tool {
         if (!target) return 'No URL given.'
 
         // Keyless public endpoint by default; keyed endpoint + X-API-Key with a key.
+        // POST /v1/fetch: GET is deprecated and sunsets 1 Mar 2027.
         const path = this.apiKey ? '/v1/fetch' : '/v1/fetch/public'
-        const params = new URLSearchParams({ url: target, max_chars: String(this.maxChars) })
-        if (this.live) params.set('live', 'true')
+        const body: Record<string, unknown> = {
+            urls: [target],
+            content: { max_chars: this.maxChars }
+        }
+        if (this.live) body.retrieval = { max_age_hours: 0 }
 
         const headers: Record<string, string> = {
             'User-Agent': 'keenable-keelflow',
+            'Content-Type': 'application/json',
             // App name, required by the keyless endpoint.
             'X-Keenable-Title': 'Keelflow'
         }
         if (this.apiKey) headers['X-API-Key'] = this.apiKey
 
-        const resp = await secureFetch(`${this.apiBase}${path}?${params.toString()}`, {
-            method: 'GET',
+        const resp = await secureFetch(`${this.apiBase}${path}`, {
+            method: 'POST',
             headers,
+            body: JSON.stringify(body),
             signal: AbortSignal.timeout(60 * 1000) as any
         })
 
@@ -188,7 +196,12 @@ class KeenableFetchTool extends Tool {
             throw new Error(`Keenable request failed: ${resp.status} ${resp.statusText}`)
         }
 
-        const res: KeenableFetchResponse = await resp.json()
+        const envelope = await resp.json()
+        const res: KeenableFetchResponse | undefined = Array.isArray(envelope?.results) ? envelope.results[0] : undefined
+        if (res?.error) {
+            const err = res.error
+            throw new Error(err.message || err.error || 'Keenable fetch failed')
+        }
         if (!res?.content) return 'No content found.'
 
         const title = res.title ? `# ${res.title}\n\n` : ''
